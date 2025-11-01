@@ -1,0 +1,204 @@
+-- MOBILE SERVER HOPPER - FIREBASE (via Render bridge)
+-- Reads JobIds from your Render server (backed by Firebase), and writes block/skip ops back to it
+
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Players = game:GetService("Players")
+
+-- ===== CONFIG =====
+local CONFIG = {
+    BRIDGE_URL = (getgenv and getgenv().HOPPER_BRIDGE_URL) or "https://mobiwqe23ijh293gn34g34g-1.onrender.com",
+    CHECK_INTERVAL = 0.25,
+    RETRY_DELAY = 0.5,
+    MAX_RETRY_ATTEMPTS = 3,
+    FAST_MODE = true,
+    CACHE_TTL = 2,
+    MAX_LOOP_BURST = 15,
+}
+
+-- ===== HTTP REQUEST DETECTION (matches autojoiner.lua style) =====
+local function buildHttpRequest()
+    local g = getgenv and getgenv() or _G
+    local candidates = {
+        g and g.request,
+        rawget(_G, "request"),
+        g and g.http_request,
+        rawget(_G, "http_request"),
+        (syn and syn.request),
+        (http and http.request),
+        (fluxus and fluxus.request),
+        rawget(_G, "httprequest"),
+    }
+    for _, fn in ipairs(candidates) do
+        if type(fn) == "function" then return fn end
+    end
+    return nil
+end
+
+local request = buildHttpRequest()
+if not request then error("No HTTP request function found!") end
+
+-- ===== SHARED STATE =====
+_G.ServerHopperShared = _G.ServerHopperShared or { assignedJobIds = {}, localBlocklist = {} }
+local State = { currentJobId = nil, isAttemptingJoin = false, retryCount = 0, assignedJobIds = {} }
+
+-- ===== UTILS =====
+local function log(msg, level)
+    if CONFIG.FAST_MODE and level ~= "ERROR" and level ~= "WARN" then return end
+    print(string.format("[%s] %s", level or "INFO", msg))
+end
+local function logError(m) log(m, "ERROR") end
+local function logWarn(m) log(m, "WARN") end
+
+-- ===== BRIDGE API =====
+local _cache = { data = nil, ts = 0 }
+
+local function httpJSON(method, path, bodyTable)
+    local ok, resp = pcall(function()
+        return request({
+            Url = string.format("%s%s", CONFIG.BRIDGE_URL, path),
+            Method = method,
+            Headers = { ["Accept"] = "application/json", ["Content-Type"] = "application/json" },
+            Body = bodyTable and HttpService:JSONEncode(bodyTable) or nil
+        })
+    end)
+    if not ok or not resp then return nil end
+    if resp.StatusCode ~= 200 then return { _status = resp.StatusCode } end
+    local parseOK, data = pcall(function() return HttpService:JSONDecode(resp.Body) end)
+    if not parseOK then return nil end
+    return data
+end
+
+local function fetchStore(force)
+    local now = os.clock()
+    if not force and _cache.data and (now - _cache.ts) < CONFIG.CACHE_TTL then return _cache.data end
+    local data = httpJSON("GET", "/jobstore")
+    if data and type(data) == "table" then _cache.data = data; _cache.ts = now; return data end
+    return _cache.data
+end
+
+local function bridgeBlock(jobId, reason)
+    local _ = httpJSON("POST", "/jobstore/block", { jobId = jobId, reason = reason or "client" })
+end
+local function bridgeSkip(jobId)
+    local _ = httpJSON("POST", "/jobstore/skip", { jobId = jobId })
+end
+
+-- ===== JOB PICKING =====
+local function getNextJobId()
+    local data = fetchStore()
+    if not data then return nil end
+    local available = data.availableJobIds or {}
+    local blocklist = data.blocklist or {}
+
+    if #available == 0 then return nil end
+
+    local blocked = {}
+    for _, b in ipairs(blocklist) do blocked[b] = true end
+    for _, b in ipairs(_G.ServerHopperShared.localBlocklist) do if type(b) == "string" then blocked[b] = true end end
+
+    local tried = {}; for _, t in ipairs(State.assignedJobIds) do tried[t] = true end
+    local claimed = _G.ServerHopperShared.assignedJobIds
+
+    local pick, count
+    for _, id in ipairs(available) do
+        if not blocked[id] and not tried[id] and (not claimed[id] or claimed[id] == "MOBILE") then
+            count = (count or 0) + 1
+            if math.random(count) == 1 then pick = id end
+        end
+    end
+    if not pick then return nil end
+    table.insert(State.assignedJobIds, pick)
+    claimed[pick] = "MOBILE"
+    return pick
+end
+
+local function addLocalBlock(jobId)
+    if not _G.ServerHopperShared.localBlocklist[jobId] then
+        table.insert(_G.ServerHopperShared.localBlocklist, jobId)
+        _G.ServerHopperShared.localBlocklist[jobId] = true
+    end
+    if _cache.data and _cache.data.availableJobIds then
+        local out = {}
+        for _, id in ipairs(_cache.data.availableJobIds) do if id ~= jobId then table.insert(out, id) end end
+        _cache.data.availableJobIds = out
+    end
+end
+
+-- ===== TELEPORT =====
+local function parseError(err)
+    local e = tostring(err):lower()
+    if e:find("full") or e:find("capacity") then return "full" end
+    if e:find("ended") or e:find("game ended") then return "ended" end
+    if e:find("private") or e:find("unauthorized") or e:find("restricted") then return "private" end
+    if e:find("invalid") or e:find("not found") then return "invalid" end
+    return "unknown"
+end
+
+local function attemptTeleport(jobId)
+    if State.isAttemptingJoin then return false end
+    if not jobId or jobId == "" then return false end
+    State.isAttemptingJoin = true
+    if not CONFIG.FAST_MODE then log("Attempt teleport -> "..jobId.." | place="..tostring(game.PlaceId)) end
+
+    -- pre-block remotely so other clients don't race
+    addLocalBlock(jobId)
+    task.spawn(function() bridgeBlock(jobId, "pre_block") end)
+
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, Players.LocalPlayer)
+    end)
+    if not ok then
+        local kind = parseError(err)
+        if kind == "full" then
+            bridgeSkip(jobId)
+        else
+            bridgeBlock(jobId, "teleport_failed_"..kind)
+        end
+        State.isAttemptingJoin = false
+        State.currentJobId = nil
+        State.retryCount = State.retryCount + 1
+        return false
+    end
+    if not CONFIG.FAST_MODE then log("Teleport initiated: "..jobId) end
+    return true
+end
+
+-- ===== MAIN LOOP =====
+local function mainLoop()
+    log("Hopper (Firebase) starting...")
+    local burst = 0
+    while true do
+        if game.JobId ~= "" and game.JobId == State.currentJobId then
+            wait(5)
+        else
+            if State.retryCount >= CONFIG.MAX_RETRY_ATTEMPTS then
+                if State.currentJobId then bridgeBlock(State.currentJobId, "max_retries") end
+                State.currentJobId = nil
+                State.retryCount = 0
+                wait(CONFIG.RETRY_DELAY)
+            end
+            if not State.currentJobId then
+                State.currentJobId = getNextJobId()
+                if not State.currentJobId then wait(CONFIG.RETRY_DELAY) end
+            end
+            if State.currentJobId then
+                local jid = State.currentJobId
+                if jid and jid ~= "" then
+                    attemptTeleport(jid)
+                else
+                    State.currentJobId = nil
+                end
+            end
+        end
+        burst = burst + 1
+        if burst >= CONFIG.MAX_LOOP_BURST then burst = 0; wait(CONFIG.CHECK_INTERVAL) else task.wait() end
+    end
+end
+
+spawn(function()
+    local ok, err = pcall(mainLoop)
+    if not ok then logError("Fatal: "..tostring(err)) end
+end)
+
+log("✅ mobileserverhop_firebase loaded. Set getgenv().HOPPER_BRIDGE_URL to your Render URL before executing.")
